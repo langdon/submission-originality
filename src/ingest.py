@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
-from urllib.parse import quote, urlparse
-
-import requests
+from urllib.parse import urlparse
 
 from src.models import Commit, IngestResult, RepoSpec
 
@@ -55,7 +55,6 @@ def ingest_repo(
     spec: RepoSpec,
     github_token: str | None = None,
     gitlab_token: str | None = None,
-    session: requests.Session | None = None,
 ) -> IngestResult:
     result = IngestResult(spec=spec)
 
@@ -65,222 +64,113 @@ def ingest_repo(
         result.errors.append(str(exc))
         return result
 
-    if parsed.provider == "unknown":
-        result.warnings.append(f"Unsupported host '{parsed.host}' for {spec.repo_url}; skipped")
-        return result
-
-    client = session or requests.Session()
     github_token = github_token if github_token is not None else os.getenv("GITHUB_TOKEN")
     gitlab_token = gitlab_token if gitlab_token is not None else os.getenv("GITLAB_TOKEN")
 
+    clone_url = spec.repo_url
+    active_token: str | None = None
     if parsed.provider == "github":
-        _ingest_github(result, parsed, client, github_token)
+        active_token = github_token
+        if github_token:
+            owner = parsed.owner or ""
+            repo = parsed.repo or ""
+            clone_url = f"https://{github_token}@{parsed.host}/{owner}/{repo}.git"
     elif parsed.provider == "gitlab":
-        _ingest_gitlab(result, parsed, client, gitlab_token)
+        active_token = gitlab_token
+        if gitlab_token:
+            namespace = parsed.namespace or ""
+            repo = parsed.repo or ""
+            path = f"{namespace}/{repo}".strip("/")
+            clone_url = f"https://oauth2:{gitlab_token}@{parsed.host}/{path}.git"
 
-    return result
-
-
-def _ingest_github(
-    result: IngestResult,
-    parsed: ParsedRepoURL,
-    session: requests.Session,
-    token: str | None,
-) -> None:
-    owner = parsed.owner or ""
-    repo = parsed.repo or ""
-
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    commits_url = f"https://api.github.com/repos/{owner}/{repo}/commits"
-    params = {"per_page": 100}
-    page = 1
-
-    while True:
-        params["page"] = page
-        response = _safe_get(session, commits_url, headers=headers, params=params)
-        if response is None:
-            result.errors.append(f"GitHub request failed for {result.spec.repo_url}")
-            return
-
-        if response.status_code in {401, 403}:
-            if token:
-                result.errors.append(
-                    f"GitHub access denied for {result.spec.repo_url}; token may lack scope"
-                )
-            else:
-                result.warnings.append(
-                    f"GitHub repo may be private: {result.spec.repo_url}; missing token, skipped"
-                )
-            return
-
-        if response.status_code == 404:
-            result.errors.append(f"GitHub repo not found or unreachable: {result.spec.repo_url}")
-            return
-
-        if response.status_code >= 400:
-            result.errors.append(
-                f"GitHub API error ({response.status_code}) for {result.spec.repo_url}"
-            )
-            return
-
-        page_data = response.json()
-        if not isinstance(page_data, list) or not page_data:
-            break
-
-        for item in page_data:
-            sha = str(item.get("sha") or "")
-            if not sha:
-                continue
-
-            detail_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}"
-            detail = _safe_get(session, detail_url, headers=headers)
-            if detail is None or detail.status_code >= 400:
-                result.warnings.append(
-                    f"Failed to fetch commit details for {sha} in {result.spec.repo_url}"
-                )
-                continue
-
-            detail_data = detail.json()
-            commit_obj = detail_data.get("commit") or {}
-            author_obj = commit_obj.get("author") or {}
-            files = detail_data.get("files") or []
-
-            result.commits.append(
-                Commit(
-                    sha=sha,
-                    author=str(author_obj.get("name") or "unknown"),
-                    email=str(author_obj.get("email") or "unknown"),
-                    timestamp=_normalize_timestamp(str(author_obj.get("date") or "")),
-                    message=str(commit_obj.get("message") or ""),
-                    files_changed=[
-                        str(file_obj.get("filename"))
-                        for file_obj in files
-                        if isinstance(file_obj, dict) and file_obj.get("filename")
-                    ],
-                )
-            )
-
-        if len(page_data) < 100:
-            break
-        page += 1
-
-
-def _ingest_gitlab(
-    result: IngestResult,
-    parsed: ParsedRepoURL,
-    session: requests.Session,
-    token: str | None,
-) -> None:
-    host = parsed.host
-    namespace = parsed.namespace or ""
-    repo = parsed.repo or ""
-    project_path = f"{namespace}/{repo}" if namespace else repo
-    encoded_project = quote(project_path, safe="")
-
-    headers: dict[str, str] = {}
-    if token:
-        headers["PRIVATE-TOKEN"] = token
-
-    commits_url = f"https://{host}/api/v4/projects/{encoded_project}/repository/commits"
-    page = 1
-    per_page = 100
-
-    while True:
-        response = _safe_get(
-            session,
-            commits_url,
-            headers=headers,
-            params={"per_page": per_page, "page": page},
-        )
-        if response is None:
-            result.errors.append(f"GitLab request failed for {result.spec.repo_url}")
-            return
-
-        if response.status_code in {401, 403}:
-            if token:
-                result.errors.append(
-                    f"GitLab access denied for {result.spec.repo_url}; token may lack scope"
-                )
-            else:
-                result.warnings.append(
-                    f"GitLab repo may be private: {result.spec.repo_url}; missing token, skipped"
-                )
-            return
-
-        if response.status_code == 404:
-            result.errors.append(f"GitLab repo not found or unreachable: {result.spec.repo_url}")
-            return
-
-        if response.status_code >= 400:
-            result.errors.append(
-                f"GitLab API error ({response.status_code}) for {result.spec.repo_url}"
-            )
-            return
-
-        page_data = response.json()
-        if not isinstance(page_data, list) or not page_data:
-            break
-
-        for item in page_data:
-            sha = str(item.get("id") or "")
-            if not sha:
-                continue
-
-            detail_url = (
-                f"https://{host}/api/v4/projects/{encoded_project}/repository/commits/{sha}"
-            )
-            detail = _safe_get(session, detail_url, headers=headers)
-            if detail is None or detail.status_code >= 400:
-                result.warnings.append(
-                    f"Failed to fetch commit details for {sha} in {result.spec.repo_url}"
-                )
-                continue
-
-            diff_url = (
-                f"https://{host}/api/v4/projects/{encoded_project}/repository/commits/{sha}/diff"
-            )
-            diff = _safe_get(session, diff_url, headers=headers)
-            if diff is None or diff.status_code >= 400:
-                files_changed: list[str] = []
-            else:
-                diff_data = diff.json()
-                files_changed = [
-                    str(entry.get("new_path") or entry.get("old_path"))
-                    for entry in diff_data
-                    if isinstance(entry, dict)
-                    and (entry.get("new_path") or entry.get("old_path"))
-                ]
-
-            detail_data = detail.json()
-            result.commits.append(
-                Commit(
-                    sha=sha,
-                    author=str(detail_data.get("author_name") or "unknown"),
-                    email=str(detail_data.get("author_email") or "unknown"),
-                    timestamp=_normalize_timestamp(str(detail_data.get("committed_date") or "")),
-                    message=str(detail_data.get("message") or ""),
-                    files_changed=files_changed,
-                )
-            )
-
-        if len(page_data) < per_page:
-            break
-        page += 1
-
-
-def _safe_get(
-    session: requests.Session,
-    url: str,
-    headers: dict[str, str] | None = None,
-    params: dict[str, Any] | None = None,
-) -> requests.Response | None:
+    temp_dir = tempfile.mkdtemp(prefix="submission-originality-")
+    repo_dir = os.path.join(temp_dir, "repo.git")
     try:
-        return session.get(url, headers=headers, params=params, timeout=30)
-    except requests.RequestException:
-        return None
+        clone_proc = subprocess.run(
+            ["git", "clone", "--bare", clone_url, repo_dir],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if clone_proc.returncode != 0:
+            message = _sanitize_error_message(clone_proc.stderr or clone_proc.stdout, active_token)
+            if parsed.provider == "unknown":
+                result.warnings.append(
+                    f"Unable to clone unknown host repo {spec.repo_url}; skipped ({message})"
+                )
+                return result
+
+            if not active_token and _looks_like_auth_failure(message):
+                result.warnings.append(
+                    f"Repo may be private: {spec.repo_url}; missing token, skipped"
+                )
+                return result
+
+            result.errors.append(f"Failed to clone repo {spec.repo_url}: {message}")
+            return result
+
+        log_proc = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_dir,
+                "log",
+                "--pretty=format:%H%x00%an%x00%ae%x00%aI%x00%s",
+                "--name-only",
+                "--no-merges",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if log_proc.returncode != 0:
+            message = _sanitize_error_message(log_proc.stderr or log_proc.stdout, active_token)
+            result.errors.append(f"Failed to read commit history for {spec.repo_url}: {message}")
+            return result
+
+        result.commits = _parse_git_log_output(log_proc.stdout)
+        return result
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _parse_git_log_output(output: str) -> list[Commit]:
+    commits: list[Commit] = []
+    for block in output.split("\n\n"):
+        block = block.strip("\n")
+        if not block:
+            continue
+        lines = block.splitlines()
+        header = lines[0]
+        parts = header.split("\x00")
+        if len(parts) != 5:
+            continue
+        sha, author, email, timestamp, message = parts
+        files_changed = [line.strip() for line in lines[1:] if line.strip()]
+        commits.append(
+            Commit(
+                sha=sha,
+                author=author,
+                email=email,
+                timestamp=_normalize_timestamp(timestamp),
+                message=message,
+                files_changed=files_changed,
+            )
+        )
+    return commits
+
+
+def _looks_like_auth_failure(message: str) -> bool:
+    text = message.lower()
+    markers = ["authentication failed", "could not read username", "access denied", "unauthorized"]
+    return any(marker in text for marker in markers)
+
+
+def _sanitize_error_message(message: str, token: str | None) -> str:
+    cleaned = " ".join(message.strip().split()) if message else "unknown error"
+    if token:
+        cleaned = cleaned.replace(token, "***")
+    return cleaned
 
 
 def _normalize_timestamp(raw_value: str) -> str:
