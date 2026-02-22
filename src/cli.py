@@ -4,6 +4,7 @@ import argparse
 
 from src.config import load_app_config, load_repo_specs
 from src.ingest import ingest_repo
+from src.temporal import analyze_repo
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -12,6 +13,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", required=True, help="Hackathon config YAML")
     parser.add_argument("--github-token", default=None, help="GitHub token override")
     parser.add_argument("--gitlab-token", default=None, help="GitLab token override")
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Run temporal originality analysis after ingestion",
+    )
     return parser
 
 
@@ -21,7 +27,7 @@ def main() -> int:
 
     try:
         specs = load_repo_specs(args.input)
-        _ = load_app_config(args.config)
+        app_config = load_app_config(args.config)
     except (FileNotFoundError, ValueError) as exc:
         print(f"Configuration error: {exc}")
         return 1
@@ -39,6 +45,22 @@ def main() -> int:
         total_errors += len(result.errors)
 
         print(f"{spec.team} | {spec.repo_url} | commits={len(result.commits)}")
+        if args.analyze:
+            report = analyze_repo(result, app_config.hackathon_window)
+            largest_pre = len(report.largest_pre_commit.files_changed) if report.largest_pre_commit else 0
+            first_in_window = (
+                report.first_in_window_commit.timestamp if report.first_in_window_commit else "none"
+            )
+            print(
+                "  analysis: "
+                f"pre={report.pre_window} "
+                f"in={report.in_window} "
+                f"post={report.post_window} "
+                f"pre_pct={report.pre_window_pct:.1f}% "
+                f"largest_pre_files={largest_pre} "
+                f"first_in_window={first_in_window} "
+                f"risk={report.risk_flag} ({report.risk_reason})"
+            )
         for warning in result.warnings:
             print(f"  warning: {warning}")
         for error in result.errors:
