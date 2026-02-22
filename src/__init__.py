@@ -1,0 +1,1 @@
+"""Submission originality ingestion package."""
