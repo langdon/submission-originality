@@ -95,6 +95,7 @@ def _row_to_submission(row: dict[str, str], source: str, idx: int) -> Submission
             "github",
             "gitlab",
         ),
+        _first_key_containing(row, "github", "git hub", "gitlab"),
         _first_non_empty(row, "project url", "submission url"),
     )
     repo_urls = _extract_repo_urls(repo_blob)
@@ -116,6 +117,17 @@ def _first_non_empty(row: dict[str, str], *candidates: str) -> str:
         value = normalized.get(_normalize_key(key), "")
         if value:
             return value
+    return ""
+
+
+def _first_key_containing(row: dict[str, str], *substrings: str) -> str:
+    """Return the first non-empty value whose column name contains any of the substrings."""
+    normalized = {_normalize_key(k): (v or "").strip() for k, v in row.items()}
+    for substr in substrings:
+        norm_substr = _normalize_key(substr)
+        for key, value in normalized.items():
+            if norm_substr in key and value:
+                return value
     return ""
 
 
@@ -150,17 +162,31 @@ def _extract_repo_urls(value: str) -> list[str]:
     seen: set[str] = set()
 
     for url in urls:
-        host = urlparse(url).netloc.lower()
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
         if not host:
             continue
         if "github.com" not in host and "gitlab" not in host:
             continue
-        if url in seen:
+        normalized = _normalize_repo_url(parsed)
+        if normalized in seen:
             continue
-        seen.add(url)
-        repos.append(url)
+        seen.add(normalized)
+        repos.append(normalized)
 
     return repos
+
+
+def _normalize_repo_url(parsed) -> str:
+    """Strip /tree/... and /blob/... suffixes and .git to get the clonable repo root URL."""
+    parts = parsed.path.rstrip("/").split("/")
+    # GitHub/GitLab repo root is /{owner}/{repo} — 3 segments including leading ""
+    if len(parts) > 3:
+        parts = parts[:3]
+    # Strip .git suffix from repo name for consistent deduplication
+    if len(parts) == 3 and parts[2].endswith(".git"):
+        parts[2] = parts[2][:-4]
+    return f"{parsed.scheme}://{parsed.netloc}{'/'.join(parts)}"
 
 
 def _extract_urls(value: str) -> list[str]:
