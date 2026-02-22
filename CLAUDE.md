@@ -39,7 +39,7 @@ pip install -r requirements.txt
 pytest -q
 
 # Run checker (once CLI exists)
-python -m src.main --config civic-hacks-2026/config.yml
+python -m src.cli --config civic-hacks-2026/config.yml
 ```
 
 ## Key design constraints
