@@ -53,6 +53,29 @@ python -m src.main --config civic-hacks-2026/config.yml
 - **Descriptive output**: flags explain *why* something was flagged; no opaque scores
 - **Privacy**: report must be easy to redact/anonymize before sharing publicly
 
+## Worktree convention
+
+Each issue gets its own git worktree. Never implement on `main` directly.
+
+```bash
+# Set up a worktree for issue #N
+REPO=~/loc-projects/submission-originality
+git -C "$REPO" worktree add "$REPO/wt/issue-N" -b feat/N-short-description
+
+# Work in the worktree
+cd "$REPO/wt/issue-N"
+
+# Clean up after merge
+git -C "$REPO" worktree remove wt/issue-N
+```
+
+Host path (for prompts): `~/loc-projects/submission-originality/wt/issue-N`
+
+**Codex web**: creates a branch directly (no filesystem access) — worktree
+not applicable. The build prompt handles this adaptively.
+
+**Local agents / direct sessions**: use a worktree as above for isolation.
+
 ## Build Prompt Consumption (Task Mode)
 
 When invoked like `implement #<N>` or `read CLAUDE.md and implement #<N>`:
