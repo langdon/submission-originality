@@ -1,1 +1,4 @@
-civic-hacks-2026/
+__pycache__/
+*.pyc
+civic-hacks-2026/*
+!civic-hacks-2026/config.yml.example
